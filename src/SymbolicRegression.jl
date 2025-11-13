@@ -455,6 +455,15 @@ which is useful for debugging and profiling.
     - Single output: `["x1^2 + x2", "sin(x1) * x2"]`
     - Multi-output: `[["x1 + x2"], ["x1 * x2", "x1 - x2"]]`
     Constants will be automatically optimized.
+- `initial_population::Union{Population,Vector{<:Population},Nothing}=nothing`: Custom
+    initial population to use instead of randomly generated population. If a single
+    `Population` is provided, it will be used for all outputs and populations. If a
+    vector of `Population` objects is provided:
+    - If length matches number of outputs, each output uses its corresponding population
+    - If length matches number of populations, each population uses its corresponding population
+    - Otherwise, the first population is used for all
+    The population size must match `options.population_size`, otherwise a random population
+    will be generated instead.
 
 # Returns
 - `hallOfFame::HallOfFame`: The best equations seen during the search.
@@ -491,6 +500,7 @@ function equation_search(
     y_units=nothing,
     extra::NamedTuple=NamedTuple(),
     guesses::Union{AbstractVector,AbstractVector{<:AbstractVector},Nothing}=nothing,
+    initial_population::Union{Population,Vector{<:Population},Nothing}=nothing,
     v_dim_out::Val{DIM_OUT}=Val(nothing),
     # Deprecated:
     multithreaded=nothing,
@@ -539,18 +549,36 @@ function equation_search(
         logger=logger,
         progress=progress,
         guesses=guesses,
+        initial_population=initial_population,
         v_dim_out=Val(DIM_OUT),
     )
 end
 
 function equation_search(
-    X::AbstractMatrix{T}, y::AbstractVector; kw...
+    X::AbstractMatrix{T}, 
+    y::AbstractVector;
+    initial_population::Union{Population,Vector{<:Population},Nothing}=nothing,
+    kw...
 ) where {T<:DATA_TYPE}
-    return equation_search(X, reshape(y, (1, size(y, 1))); kw..., v_dim_out=Val(1))
+    return equation_search(
+        X, reshape(y, (1, size(y, 1))); 
+        initial_population=initial_population,
+        kw..., 
+        v_dim_out=Val(1)
+    )
 end
 
-function equation_search(dataset::Dataset; kws...)
-    return equation_search([dataset]; kws..., v_dim_out=Val(1))
+function equation_search(
+    dataset::Dataset;
+    initial_population::Union{Population,Vector{<:Population},Nothing}=nothing,
+    kws...
+)
+    return equation_search(
+        [dataset]; 
+        initial_population=initial_population,
+        kws..., 
+        v_dim_out=Val(1)
+    )
 end
 
 function equation_search(
@@ -558,6 +586,7 @@ function equation_search(
     options::AbstractOptions=Options(),
     saved_state=nothing,
     guesses::Union{AbstractVector,AbstractVector{<:AbstractVector},Nothing}=nothing,
+    initial_population::Union{Population,Vector{<:Population},Nothing}=nothing,
     runtime_options::Union{AbstractRuntimeOptions,Nothing}=nothing,
     runtime_options_kws...,
 ) where {T<:DATA_TYPE,L<:LOSS_TYPE,D<:Dataset{T,L}}
@@ -573,7 +602,7 @@ function equation_search(
     )
 
     # Underscores here mean that we have mutated the variable
-    return _equation_search(datasets, _runtime_options, options, saved_state, guesses)
+    return _equation_search(datasets, _runtime_options, options, saved_state, guesses, initial_population)
 end
 
 @noinline function _equation_search(
@@ -582,10 +611,11 @@ end
     options::AbstractOptions,
     saved_state,
     guesses,
+    initial_population,
 ) where {D<:Dataset}
     _validate_options(datasets, ropt, options)
     state = _create_workers(datasets, ropt, options)
-    _initialize_search!(state, datasets, ropt, options, saved_state, guesses)
+    _initialize_search!(state, datasets, ropt, options, saved_state, guesses, initial_population)
     _warmup_search!(state, datasets, ropt, options)
     _main_search_loop!(state, datasets, ropt, options)
     _tear_down!(state, ropt, options)
@@ -723,6 +753,7 @@ function _initialize_search!(
     options::AbstractOptions,
     saved_state,
     guesses::Union{AbstractVector,AbstractVector{<:AbstractVector},Nothing},
+    initial_population::Union{Population,Vector{<:Population},Nothing},
 ) where {T,L,N}
     nout = length(datasets)
 
@@ -755,6 +786,17 @@ function _initialize_search!(
         end
     end
 
+    # Process initial_population parameter
+    initial_pops = if initial_population === nothing
+        nothing
+    elseif initial_population isa Population
+        # Single population: use for all outputs and populations
+        [initial_population]
+    else
+        # Vector of populations
+        initial_population
+    end
+
     for j in 1:nout, i in 1:(options.populations)
         worker_idx = assign_next_worker!(
             state.worker_assignment; out=j, pop=i, parallelism=ropt.parallelism, state.procs
@@ -777,6 +819,59 @@ function _initialize_search!(
                     parallelism = ropt.parallelism,
                     worker_idx = worker_idx
                 )
+            elseif initial_pops !== nothing
+                # Use custom initial population
+                # Select population: if vector length matches nout, use j-th; otherwise use first
+                pop_idx = if length(initial_pops) == nout
+                    j
+                elseif length(initial_pops) == options.populations
+                    i
+                else
+                    1
+                end
+                custom_pop = initial_pops[min(pop_idx, length(initial_pops))]
+                
+                # Validate and prepare custom population
+                if length(custom_pop.members) != options.population_size
+                    if ropt.verbosity > 0
+                        @warn "Custom initial population size ($(length(custom_pop.members))) doesn't match options.population_size ($(options.population_size)). Using random population instead."
+                    end
+                    # Fall back to random population
+                    @sr_spawner(
+                        begin
+                            (
+                                Population(
+                                    datasets[j];
+                                    population_size=options.population_size,
+                                    nlength=3,
+                                    options=options,
+                                    nfeatures=max_features(datasets[j], options),
+                                ),
+                                HallOfFame(options, datasets[j]),
+                                RecordType(),
+                                Float64(options.population_size),
+                            )
+                        end,
+                        parallelism = ropt.parallelism,
+                        worker_idx = worker_idx
+                    )
+                else
+                    # Use custom population - update losses for the dataset
+                    _custom_pop = strip_metadata(custom_pop, options, datasets[j])
+                    for member in _custom_pop.members
+                        cost, result_loss = eval_cost(datasets[j], member, options)
+                        member.cost = cost
+                        member.loss = result_loss
+                    end
+                    copy_custom_pop = copy(_custom_pop)
+                    @sr_spawner(
+                        begin
+                            (copy_custom_pop, HallOfFame(options, datasets[j]), RecordType(), 0.0)
+                        end,
+                        parallelism = ropt.parallelism,
+                        worker_idx = worker_idx
+                    )
+                end
             else
                 if saved_pop !== nothing && ropt.verbosity > 0
                     @warn "Recreating population (output=$(j), population=$(i)), as the saved one doesn't have the correct number of members."

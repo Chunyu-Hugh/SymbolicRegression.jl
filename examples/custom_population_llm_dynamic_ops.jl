@@ -122,20 +122,37 @@ function create_llm_prompt(
     total_rounds::Int,
     select_count::Int,
     population_size::Int,
+    current_binary_ops::Vector{String},
+    current_unary_ops::Vector{String},
 )
     new_needed = population_size - select_count
+    
+    # 列出所有可用的算子（包括库中但未激活的）
+    available_unary = join(keys(UNARY_OPERATOR_LIBRARY), ", ")
+    available_binary = join(keys(BINARY_OPERATOR_LIBRARY), ", ")
+    
+    current_ops_info = "当前已激活的算子：\n"
+    current_ops_info *= "  二元算子: $(join(current_binary_ops, ", "))\n"
+    current_ops_info *= "  一元算子: $(join(current_unary_ops, ", "))\n"
+    current_ops_info *= "\n系统支持的算子库：\n"
+    current_ops_info *= "  可用一元算子: $available_unary\n"
+    current_ops_info *= "  可用二元算子: $available_binary\n"
+    
     return """
 你是一位符号回归与物理建模专家。我们已经完成第 $round/$total_rounds 轮搜索。
+
+$current_ops_info
 
 $equations_text
 
 请完成以下任务：
 1. 分析这些表达式的物理含义、类型（例如多项式、三角函数、有理函数等），以及它们可能描述的物理机制。
 2. 选出 $select_count 个最值得保留和继续探索的表达式（索引从 1 开始）。
-3. 基于你的分析，再生成 $new_needed 个新的候选表达式，要求：
+3. **重要：基于你的分析，建议需要添加的新算子**。如果当前算子不足以表达数据中的模式，请明确建议需要哪些新算子（从系统支持的算子库中选择）。
+4. 基于你的分析，再生成 $new_needed 个新的候选表达式，要求：
    
-   - 使用 +, -, *, /, safe_pow(·,·) 等运算
-   - 如需引入其他算子，请直接写出函数名，如 cos、sin、exp、log 等
+   - 可以使用当前已激活的算子
+   - 如果建议了新算子，可以在表达式中使用这些新算子（即使它们还未激活）
    - 复杂度与被选中的表达式相当或略高
    - 表达式必须使用变量名 x1,x2,x3,x4,x5
    - 不能出现除 x1,x2,x3,x4,x5 以外的变量名
@@ -144,6 +161,10 @@ $equations_text
 {
   "analysis": "...",
   "selected_indices": [1, 3, 5],
+  "suggested_operators": {
+    "binary": ["max", "min"],
+    "unary": ["cos", "sin"]
+  },
   "new_expressions": [
     "2.0 * cos(x4) + safe_pow(x1, 2) - 2.0",
     "(x1 + x2) * cos(x4)",
@@ -151,6 +172,11 @@ $equations_text
   ],
   "reasoning": "..."
 }
+
+注意：
+- suggested_operators 中的算子必须来自系统支持的算子库
+- 如果不需要新算子，suggested_operators 可以为空数组
+- 建议的算子会在下一轮搜索前自动激活
 """
 end
 
@@ -160,12 +186,12 @@ function parse_llm_response(response::String)
     if json_start === nothing || json_end === nothing
         chars = collect(response)
         snippet = String(chars[1:min(length(chars), 200)])
-        return (Int[], String[], "无法解析 JSON。响应片段: $snippet")
+        return (Int[], String[], String[], String[], "无法解析 JSON。响应片段: $snippet")
     end
     parsed = try
         JSON.parse(response[json_start:json_end])
     catch e
-        return (Int[], String[], "JSON 解析失败: $e")
+        return (Int[], String[], String[], String[], "JSON 解析失败: $e")
     end
 
     indices = if haskey(parsed, "selected_indices") && parsed["selected_indices"] isa Vector
@@ -180,6 +206,19 @@ function parse_llm_response(response::String)
         String[]
     end
 
+    # 提取建议的新算子
+    suggested_binary = String[]
+    suggested_unary = String[]
+    if haskey(parsed, "suggested_operators") && parsed["suggested_operators"] isa Dict
+        ops = parsed["suggested_operators"]
+        if haskey(ops, "binary") && ops["binary"] isa Vector
+            suggested_binary = [String(op) for op in ops["binary"] if op isa AbstractString]
+        end
+        if haskey(ops, "unary") && ops["unary"] isa Vector
+            suggested_unary = [String(op) for op in ops["unary"] if op isa AbstractString]
+        end
+    end
+
     analysis = if haskey(parsed, "analysis")
         val = parsed["analysis"]
         if val isa AbstractString
@@ -192,7 +231,7 @@ function parse_llm_response(response::String)
     else
         ""
     end
-    return (indices, new_exprs, analysis)
+    return (indices, new_exprs, suggested_binary, suggested_unary, analysis)
 end
 
 function sanitize_expression(expr::String)
@@ -392,21 +431,23 @@ mutable struct OperatorState
     unary_funcs::Vector{Function}
 end
 
-function OperatorState(; binary::Vector{String}=["+", "-", "*", "/", "safe_pow"], unary::Vector{String}=["cos"])
-    binary_funcs = Function[
-        get(
-            BINARY_OPERATOR_LIBRARY,
-            name,
-            error("二元算子 '$name' 未在 BINARY_OPERATOR_LIBRARY 中注册。"),
-        ) for name in binary
-    ]
-    unary_funcs = Function[
-        get(
-            UNARY_OPERATOR_LIBRARY,
-            name,
-            error("一元算子 '$name' 未在 UNARY_OPERATOR_LIBRARY 中注册。"),
-        ) for name in unary
-    ]
+function OperatorState(; binary::Vector{String}=["+", "-", "*", "/", "safe_pow"], unary::Vector{String}=String[])
+    binary_funcs = Function[]
+    for name in binary
+        if haskey(BINARY_OPERATOR_LIBRARY, name)
+            push!(binary_funcs, BINARY_OPERATOR_LIBRARY[name])
+        else
+            error("二元算子 '$name' 未在 BINARY_OPERATOR_LIBRARY 中注册。")
+        end
+    end
+    unary_funcs = Function[]
+    for name in unary
+        if haskey(UNARY_OPERATOR_LIBRARY, name)
+            push!(unary_funcs, UNARY_OPERATOR_LIBRARY[name])
+        else
+            error("一元算子 '$name' 未在 UNARY_OPERATOR_LIBRARY 中注册。")
+        end
+    end
     return OperatorState(copy(binary), binary_funcs, copy(unary), unary_funcs)
 end
 
@@ -427,6 +468,18 @@ function operator_names_from_exprs(exprs::Vector{String})
             push!(binary_needed, name)
         end
         occursin(r"safe_pow\s*\(", sanitized) && push!(binary_needed, "safe_pow")
+    end
+    return (unique(binary_needed), unique(unary_needed))
+end
+
+function operator_names_from_members(members::Vector{<:PopMember}, options::Options)
+    binary_needed = String[]
+    unary_needed = String[]
+    for member in members
+        expr_str = string_tree(member.tree, options)
+        binary, unary = operator_names_from_exprs([expr_str])
+        append!(binary_needed, binary)
+        append!(unary_needed, unary)
     end
     return (unique(binary_needed), unique(unary_needed))
 end
@@ -537,6 +590,29 @@ function run_llm_guided_search_dynamic_ops(;
             println("复杂度: $complexity | 损失: $loss | 表达式: $equation")
         end
 
+        # 注意：equation_search 本身不会产生新算子，它只能使用 Options 中已定义的算子
+        # 这里检测的是防御性编程，实际上 equation_search 的结果只会包含已定义的算子
+        # 真正的新算子来源是 LLM 返回的表达式（见下面的 new_exprs 处理）
+        if !isempty(dominating)
+            required_binary_from_search, required_unary_from_search = operator_names_from_members(dominating, options)
+            updates_from_search = update_operator_state!(operator_state, required_binary_from_search, required_unary_from_search)
+            if !isempty(updates_from_search.added_binary) || !isempty(updates_from_search.added_unary)
+                println("\n从搜索结果中检测到新算子，已扩展算子库：")
+                !isempty(updates_from_search.added_binary) &&
+                    println("  新增二元算子: $(join(updates_from_search.added_binary, ", "))")
+                !isempty(updates_from_search.added_unary) &&
+                    println("  新增一元算子: $(join(updates_from_search.added_unary, ", "))")
+                
+                options = build_options_from_state(
+                    operator_state;
+                    population_size=population_size,
+                    maxsize=maxsize,
+                    verbosity=verbosity,
+                )
+                baseline_population, manual_members = create_manual_population(dataset, options)
+            end
+        end
+
         round == num_rounds && break
 
         if isempty(dominating)
@@ -552,14 +628,47 @@ function run_llm_guided_search_dynamic_ops(;
             num_rounds,
             select_count,
             options.population_size,
+            operator_state.binary_names,
+            operator_state.unary_names,
         )
 
         println("\n向 LLM 发送请求...")
         response = call_llm(prompt)
         println("LLM 响应:\n$response\n")
 
-        selected_indices, new_exprs, analysis = parse_llm_response(response)
+        selected_indices, new_exprs, suggested_binary, suggested_unary, analysis = parse_llm_response(response)
         println("LLM 分析: $analysis")
+        
+        # 首先处理 LLM 明确建议的新算子（在解析表达式之前）
+        if !isempty(suggested_binary) || !isempty(suggested_unary)
+            println("\nLLM 建议添加新算子：")
+            !isempty(suggested_binary) &&
+                println("  建议的二元算子: $(join(suggested_binary, ", "))")
+            !isempty(suggested_unary) &&
+                println("  建议的一元算子: $(join(suggested_unary, ", "))")
+            
+            # 验证并添加建议的算子
+            updates_from_suggestion = update_operator_state!(operator_state, suggested_binary, suggested_unary)
+            if !isempty(updates_from_suggestion.added_binary) || !isempty(updates_from_suggestion.added_unary)
+                println("已添加 LLM 建议的新算子：")
+                !isempty(updates_from_suggestion.added_binary) &&
+                    println("  新增二元算子: $(join(updates_from_suggestion.added_binary, ", "))")
+                !isempty(updates_from_suggestion.added_unary) &&
+                    println("  新增一元算子: $(join(updates_from_suggestion.added_unary, ", "))")
+                
+                # 更新 options 和 population
+                options = build_options_from_state(
+                    operator_state;
+                    population_size=population_size,
+                    maxsize=maxsize,
+                    verbosity=verbosity,
+                )
+                baseline_population, manual_members = create_manual_population(dataset, options)
+                println("算子库已更新，下一轮搜索将使用扩展后的算子集合。")
+            else
+                println("注意：建议的算子可能已经在算子库中，或不在系统支持的算子库中。")
+            end
+        end
         if isempty(selected_indices)
             println("LLM 未返回有效索引，默认选择前 $select_count 个表达式。")
             selected_indices = collect(1:select_count)
@@ -577,15 +686,17 @@ function run_llm_guided_search_dynamic_ops(;
             string_tree(member.tree, options) for member in selected_members_old
         ]
         all_candidate_exprs = vcat(selected_expr_strings, new_exprs)
+        # 从 LLM 返回的表达式（new_exprs）中检测新算子
+        # 这是新算子的主要来源：LLM 可以"建议"包含新算子的表达式
         required_binary, required_unary = operator_names_from_exprs(all_candidate_exprs)
 
         updates = update_operator_state!(operator_state, required_binary, required_unary)
         if !isempty(updates.added_binary) || !isempty(updates.added_unary)
-            println("检测到新的算子，已扩展算子库：")
+            println("从 LLM 返回的表达式中检测到新算子，已扩展算子库：")
             !isempty(updates.added_binary) &&
-                println("  新增二元算子: $(join(updates.added_binary, \", \"))")
+                println("  新增二元算子: $(join(updates.added_binary, ", "))")
             !isempty(updates.added_unary) &&
-                println("  新增一元算子: $(join(updates.added_unary, \", \"))")
+                println("  新增一元算子: $(join(updates.added_unary, ", "))")
 
             options = build_options_from_state(
                 operator_state;
@@ -597,7 +708,7 @@ function run_llm_guided_search_dynamic_ops(;
         end
 
         println(
-            "当前算子集合: 二元=$(join(operator_state.binary_names, \", \")), 一元=$(join(operator_state.unary_names, \", \"))",
+            "当前算子集合: 二元=$(join(operator_state.binary_names, ", ")), 一元=$(join(operator_state.unary_names, ", "))",
         )
 
         selected_members = parse_expressions_to_members(
